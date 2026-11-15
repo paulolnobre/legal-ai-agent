@@ -1,0 +1,61 @@
+# Loki, single binary, local disk. Sized for one VPS and one application, not
+# for a cluster: no object store, no ring beyond this process, no multi-tenancy.
+#
+# Why logs are worth storing at all, when `docker logs` exists: a container's
+# log dies with the container. A redeploy erases the evidence of whatever the
+# redeploy was meant to fix, and every deploy of this project has been chasing
+# something. Loki keeps the record on disk, indexed by container and level, so
+# an investigation can start after the fact.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  # Only Grafana and Alloy talk to this, both on the internal network.
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2026-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Thirty days, the same window Prometheus keeps, so a metric spike and the
+  # log line that explains it never fall out of scope at different times.
+  retention_period: 720h
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  # One VPS, one application. These ceilings exist to stop a log loop from
+  # filling the disk, not to ration traffic.
+  ingestion_rate_mb: 8
+  ingestion_burst_size_mb: 16
+  max_streams_per_user: 1000
+  max_query_series: 5000
+  volume_enabled: true
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+  compaction_interval: 10m
+
+# Nothing here should phone home about a law firm's infrastructure.
+analytics:
+  reporting_enabled: false

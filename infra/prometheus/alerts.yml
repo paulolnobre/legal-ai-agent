@@ -1,0 +1,195 @@
+groups:
+  - name: legal-agent
+    rules:
+      # The one that was missing. On 2026-09-09 the bot was down from 12:47
+      # and it was a failed deploy log, read by a person, that said so. An
+      # outage that only a human notices is an outage nobody notices at night.
+      - alert: LegalAgentDown
+        expr: up{job="legal-ai-agent"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: The legal assistant is not answering
+          description: >-
+            Prometheus cannot scrape legal-bot. Telegram is delivering updates
+            to a webhook with nothing behind it, and every message sent to the
+            firm's assistant is being lost.
+
+      - alert: LegalAgentDeadLetterQueueNotEmpty
+        expr: legal_queue_depth{queue="dead_letter"} > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Telegram updates reached the dead-letter queue
+          description: >-
+            An update failed every retry. It is held, not lost, but nobody is
+            answering the person who sent it.
+
+      - alert: LegalAgentDependencyUnavailable
+        expr: legal_dependency_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: A required legal-agent dependency is unavailable
+
+      - alert: LegalAgentHighGraphErrorRate
+        expr: >-
+          sum(rate(legal_graph_runs_total{result="error"}[10m]))
+          /
+          clamp_min(sum(rate(legal_graph_runs_total[10m])), 0.001)
+          > 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 10% of recent agent runs failed
+
+      # Work arriving faster than it is served. The queue is meant to be near
+      # empty: a standing backlog means the worker is stuck or slow, and the
+      # people waiting have no way to tell which.
+      - alert: LegalAgentQueueBacklog
+        expr: legal_queue_depth{queue="active"} > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The active queue is not draining
+          description: >-
+            More than five updates have been waiting for five minutes. The
+            worker is stuck, slow, or restarting in a loop.
+
+      # The deferred queue holds what arrived out of hours and is drained in
+      # the morning. If it is still filling during office hours, the drain is
+      # not happening, and everything sent overnight is silently waiting.
+      - alert: LegalAgentDeferredQueueStuckInOfficeHours
+        expr: >-
+          legal_queue_depth{queue="deferred"} > 0
+          and on() (hour() >= 11 and hour() < 23)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Deferred updates are not draining during office hours
+          description: >-
+            Office hours are 08:00 to 20:01 in Sao Paulo, which is 11:00 to
+            23:01 UTC, the clock Prometheus reasons in. Inside that window the
+            deferred queue should reach zero and stay there.
+
+      # Something reserved from the queue is neither finished nor returned.
+      # This is the shape a hung update takes: no error, no retry, just an item
+      # held by a worker that is not coming back.
+      - alert: LegalAgentUpdateStuckInProcessing
+        expr: legal_queue_depth{queue="processing"} > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: An update has been in processing for ten minutes
+
+  - name: redis
+    rules:
+      # The queue is the application's memory of what it was asked to do. When
+      # Redis is gone the webhook cannot persist an update, answers 503, and
+      # Telegram retries: nothing is lost, and nothing is served.
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: The durable queue is unreachable
+          description: >-
+            The webhook cannot persist updates without Redis. Telegram will
+            keep retrying, so messages are not lost yet, but nobody is being
+            answered.
+
+      # This Redis runs noeviction on purpose: dropping a lawyer's message to
+      # free memory is not a trade this application may make. The price of that
+      # choice is that the ceiling is a wall, and every write fails at it.
+      # Eighty-five percent is where there is still time to act.
+      - alert: RedisMemoryNearLimit
+        expr: >-
+          redis_memory_used_bytes / clamp_min(redis_memory_max_bytes, 1) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Redis is close to its memory ceiling
+          description: >-
+            With maxmemory-policy noeviction, reaching the ceiling turns every
+            enqueue into an error rather than dropping old data.
+
+      # A queue whose writes are not reaching disk is a queue that only looks
+      # durable, and it looks that way right up to the restart that empties it.
+      - alert: RedisPersistenceFailing
+        expr: redis_aof_last_write_status == 0 or redis_rdb_last_bgsave_status == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Redis is failing to persist to disk
+          description: >-
+            The append-only file or the background save is failing. The queue
+            survives a restart only as far as the last successful write.
+
+      # Refused connections mean the application is being turned away by its
+      # own queue, which the application reports as a failure to enqueue and
+      # nothing more.
+      - alert: RedisRejectingConnections
+        expr: increase(redis_rejected_connections_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Redis is refusing connections
+
+      # ── the pilot budget ────────────────────────────────────────────────
+      # The pilot policy asks for a warning at 50%, 80% and 100% of the
+      # monthly budget. The application exposes the share spent, so these are
+      # thresholds on one gauge rather than three counters, and changing a
+      # ceiling in the configuration moves all three at once.
+      #
+      # None of them names a question, a client, a document or an answer:
+      # the gauge carries only the window and whether it is input or output.
+      - alert: PilotBudgetHalfSpent
+        expr: max(legal_budget_used_ratio{window="month"}) >= 0.5
+        for: 10m
+        labels:
+          # Not "info": Alertmanager here routes warning and critical, and an
+          # alert nobody routes is an alert that fires into nothing.
+          severity: warning
+        annotations:
+          summary: Half of the month's model budget is spent
+          description: >-
+            Not a problem yet, and worth knowing early: at this point in the
+            month it says whether the ceiling fits the firm's real use.
+
+      - alert: PilotBudgetMostlySpent
+        expr: max(legal_budget_used_ratio{window="month"}) >= 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Four fifths of the month's model budget is spent
+          description: >-
+            At 100% the assistant stops calling the model and says so. Raising
+            the ceiling is a decision for the firm, not a default to change
+            quietly.
+
+      # Deliberately separate from the two above rather than a threshold on the
+      # same rule: this one is not a warning about the future, it is the state
+      # the firm is in now, and the assistant is already refusing.
+      - alert: PilotBudgetSpent
+        expr: max(legal_budget_used_ratio) >= 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: The model budget is spent and the assistant is refusing
+          description: >-
+            Questions that need the model are being answered with the ceiling
+            and its reopening window. Everything that needs no model, /docs,
+            /detalhes, /processo, /arquivo and /fontes, still works.

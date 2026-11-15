@@ -1,0 +1,230 @@
+# Everything the VPS needs before a release can be deployed onto it.
+#
+# This playbook stops where the application begins. It installs the engine, the
+# firewall, the CI account and the three root-owned files the deploy path
+# refuses to run without, and then hands over: it never writes .env, never
+# restores data, and never starts the agent. Those carry secrets or live data
+# and belong to the migration runbook, not to a file that can be replayed.
+#
+#   ansible-playbook -i inventory.ini provision.yml --check   # dry run first
+#   ansible-playbook -i inventory.ini provision.yml
+#
+# Written against Ubuntu 24.04 on the Locaweb VPS in Sao Paulo. It is
+# idempotent by construction: a second run reports no changes.
+- name: Provision the VPS that runs the legal agent
+  hosts: legal_agent
+  become: true
+
+  tasks:
+    - name: Install the packages the host itself needs
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - ufw
+          - fail2ban
+          - rsync   # the deploy pipeline pushes the release with it
+          - jq
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # Ubuntu's own docker.io package trails the upstream release by enough that
+    # Compose v5 is not in it, and the runtime compose file needs v5.
+    - name: Trust the Docker signing key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Add the Docker repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') }}
+          signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/ubuntu
+          {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+
+    - name: Install Docker Engine and the Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Keep Docker running across reboots
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Keep fail2ban running across reboots
+      ansible.builtin.systemd:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    # Order matters: SSH is allowed before the firewall is switched on, or the
+    # run ends by locking itself out of the host it is configuring.
+    - name: Allow only SSH and the two web ports
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: tcp
+        comment: "{{ item.comment }}"
+      loop:
+        - { port: "22", comment: ssh }
+        - { port: "80", comment: http }
+        - { port: "443", comment: https }
+
+    - name: Deny anything else that arrives
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+
+    - name: Let the host reach the internet
+      community.general.ufw:
+        direction: outgoing
+        policy: allow
+
+    - name: Switch the firewall on
+      community.general.ufw:
+        state: enabled
+
+    # The CI account. Deliberately not in the docker group: it can do exactly
+    # one privileged thing, through the sudo rule below, and nothing else.
+    - name: Create the deployment account
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        shell: /bin/bash
+        password: "!"   # no password login, key only
+        create_home: true
+
+    - name: Install the key GitHub Actions deploys with
+      ansible.posix.authorized_key:
+        user: "{{ deploy_user }}"
+        key: "{{ deploy_public_key }}"
+        exclusive: true
+
+    - name: Create the release directory
+      ansible.builtin.file:
+        path: "{{ deploy_root }}"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0755"
+
+    # Root-owned and unreadable to anyone else: the Alertmanager config that
+    # lands here carries a bot token, and edge.env carries the ACME contact.
+    - name: Create the configuration directory
+      ansible.builtin.file:
+        path: "{{ config_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install the runtime compose file
+      ansible.builtin.copy:
+        src: ../vps/runtime-compose.yml
+        dest: "{{ config_root }}/runtime-compose.yml"
+        owner: root
+        group: root
+        # The deploy script refuses to run when this is writable by the deploy
+        # account, because whoever can edit it can mount any path as root.
+        mode: "0644"
+
+    - name: Install the TLS edge compose file
+      ansible.builtin.copy:
+        src: ../edge/edge-compose.yml
+        dest: "{{ config_root }}/edge-compose.yml"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Write the ACME contact address
+      ansible.builtin.copy:
+        content: "SSL_EMAIL={{ acme_email }}\n"
+        dest: "{{ config_root }}/edge.env"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Install the deployment entrypoint
+      ansible.builtin.copy:
+        src: ../../scripts/deploy_vps_root.sh
+        dest: /usr/local/sbin/demo-firm-deploy
+        owner: root
+        group: root
+        mode: "0700"
+
+    # Restricted to that one path with no arguments, so the account cannot ask
+    # sudo to run the script against a compose file of its own choosing.
+    - name: Let the deployment account run only that
+      ansible.builtin.copy:
+        content: "{{ deploy_user }} ALL=(root) NOPASSWD: /usr/local/sbin/demo-firm-deploy \"\"\n"
+        dest: /etc/sudoers.d/demo-firm-deploy
+        owner: root
+        group: root
+        mode: "0440"
+        validate: visudo -cf %s
+
+    # A backup that only exists on the machine being backed up is not a backup.
+    # The script refuses to run without BACKUP_REMOTE set in .env, and the
+    # rclone credentials it needs are installed by the runbook, not from here.
+    - name: Back up nightly
+      ansible.builtin.cron:
+        name: demo-firm-agent backup
+        minute: "10"
+        hour: "2"
+        job: "{{ deploy_root }}/scripts/backup.sh >> /var/log/demo-firm-backup.log 2>&1"
+
+    # A backup that was never restored is a guess. Weekly, on the night with
+    # the least traffic, after that night's backup has had two hours to land,
+    # so the drill always reads a copy made a few hours earlier.
+    - name: Restore the newest backup somewhere harmless, weekly
+      ansible.builtin.cron:
+        name: demo-firm-agent restore drill
+        minute: "10"
+        hour: "4"
+        weekday: "0"
+        job: "{{ deploy_root }}/scripts/restore_drill.sh >> /var/log/demo-firm-restore-drill.log 2>&1"
+
+    # Every deploy builds an image and leaves the previous one behind, along
+    # with its build cache. Nothing reclaims either on its own, so on a host
+    # that deploys often the disk fills with nothing but old copies of this
+    # application. The first VPS had both of these and the second did not,
+    # which is exactly the kind of difference a playbook exists to end.
+    #
+    # The random delay spreads the load: without it every host running this
+    # prunes on the same second of the same minute.
+    - name: Drop images nothing is using
+      ansible.builtin.cron:
+        name: docker image prune
+        cron_file: docker-image-prune
+        user: root
+        minute: "0"
+        hour: "0"
+        job: >-
+          sleep $(shuf -i 0-21600 -n 1) &&
+          docker image prune -af --filter "until=24h" > /dev/null 2>&1
+
+    # Weekly rather than nightly: the cache is what makes a redeploy quick, so
+    # it is worth keeping through a week of ordinary work and worth dropping
+    # before it grows without bound.
+    - name: Drop the build cache weekly
+      ansible.builtin.cron:
+        name: docker builder prune
+        cron_file: docker-builder-prune
+        user: root
+        minute: "8"
+        hour: "0"
+        weekday: "2"
+        job: docker builder prune -f > /dev/null 2>&1

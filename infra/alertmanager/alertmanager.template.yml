@@ -1,0 +1,50 @@
+# Template for /etc/demo-firm-agent/alertmanager.yml.
+#
+# It is a template because Alertmanager does not expand environment variables
+# in its configuration, and the bot token must not live in the repository.
+# scripts/install_alertmanager_config.sh renders it from the deployed .env and
+# installs the result outside the directory the deploy account can write, next
+# to runtime-compose.yml, for the same reason: a file that can send messages as
+# the firm's bot belongs to root.
+#
+# Placeholders: ${ALERT_TELEGRAM_BOT_TOKEN}, ${ALERT_TELEGRAM_CHAT_ID}.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: telegram
+  # Alerts about the same subject arrive as one message rather than a burst.
+  group_by: [alertname]
+  # Long enough to collect a related alert, short enough that an outage is not
+  # a surprise. When the bot dies, the first message lands within the minute.
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Anything critical says so again every hour until it is fixed or silenced.
+    - matchers: [severity="critical"]
+      receiver: telegram
+      repeat_interval: 1h
+
+inhibit_rules:
+  # When the application is down, everything it exports goes stale and the
+  # derived alerts say nothing new. One message about the cause beats five
+  # about the symptoms.
+  - source_matchers: [alertname="LegalAgentDown"]
+    target_matchers: [severity=~"warning|critical"]
+    equal: [job]
+
+receivers:
+  - name: telegram
+    telegram_configs:
+      - bot_token: ${ALERT_TELEGRAM_BOT_TOKEN}
+        chat_id: ${ALERT_TELEGRAM_CHAT_ID}
+        parse_mode: HTML
+        send_resolved: true
+        message: |
+          {{ if eq .Status "firing" }}🔴{{ else }}🟢{{ end }} <b>{{ .CommonLabels.alertname }}</b> ({{ .Status }})
+          {{ range .Alerts }}
+          {{ .Annotations.summary }}
+          {{ if .Annotations.description }}{{ .Annotations.description }}{{ end }}
+          {{ end }}

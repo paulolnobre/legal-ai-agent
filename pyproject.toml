@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "legal-ai-agent"
+version = "1.0.0"
+description = "Internal legal assistant for Demo & Associados"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "pyright==1.1.411"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [".venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+# Ruff does not look at types. Pyright covers what it cannot see: an Optional
+# reaching a call that cannot take None, and a dict of the wrong value type
+# unpacked into a pydantic model whose fields are int, float, bool or Literal.
+[tool.pyright]
+include = ["core", "tests", "clients"]
+exclude = [".venv", "**/__pycache__", ".ruff_cache", ".pytest_cache"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
+typeCheckingMode = "standard"

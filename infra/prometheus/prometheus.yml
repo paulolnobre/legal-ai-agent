@@ -1,0 +1,39 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# Rules that fire into nothing are decoration. This is what turns them into a
+# message: Alertmanager decides who hears about an alert, how often, and what
+# it silences.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: [alertmanager:9093]
+
+scrape_configs:
+  - job_name: legal-ai-agent
+    metrics_path: /metrics
+    static_configs:
+      - targets: [legal-bot:8000]
+
+  # The observability stack watches itself. An alerting system that goes down
+  # quietly is worse than none, because it looks exactly like calm.
+  - job_name: alertmanager
+    static_configs:
+      - targets: [alertmanager:9093]
+
+  # The durable queue itself, not the application's view of it.
+  - job_name: redis
+    static_configs:
+      - targets: [redis-exporter:9121]
+
+  - job_name: loki
+    static_configs:
+      - targets: [loki:3100]
+
+  - job_name: alloy
+    static_configs:
+      - targets: [alloy:12345]

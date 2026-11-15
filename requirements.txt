@@ -1,0 +1,34 @@
+langgraph==1.2.7
+langsmith==0.12.1
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+httpx==0.28.1
+redis[hiredis]==8.1.0
+prometheus-client==0.26.0
+pydantic==2.12.5
+pydantic-settings==2.10.1
+psycopg[binary]==3.3.4
+psycopg-pool==3.3.1
+# Sealing the Microsoft refresh tokens before they are stored: already present
+# as a transitive dependency, declared here because the token storage depends
+# on it directly and a transitive dependency disappears when its parent moves.
+cryptography==50.0.1
+python-dotenv==1.2.2
+pypdf==5.1.0
+python-docx==1.2.0
+openpyxl==3.1.5
+reportlab==4.2.5
+pdf2image==1.17.0
+Pillow==11.3.0
+pytesseract==0.3.13
+# XML from a court server is untrusted input: the stdlib parser expands
+# internal entities, and a byte-level guard against a doctype is bypassed by
+# a UTF-16 document. This refuses DTDs outright, at the parser.
+defusedxml==0.7.1
+# Verifies the passkeys (WebAuthn) the panel signs in with. Pinned exactly
+# because it decides who is let in.
+webauthn==3.0.1
+# Web Push for the app's notices (sending, VAPID signature, encryption).
+pywebpush==2.5.0
+py-vapid==1.9.4
+http-ece==1.2.1

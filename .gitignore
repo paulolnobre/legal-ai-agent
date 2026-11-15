@@ -1,0 +1,37 @@
+.env*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+*.tar.gz
+*.zip
+.agents/
+.codex/
+documentos/
+uploads/
+backups/
+*.dump
+*.backup
+
+# Local project planning and operational notes (kept in the workspace, never
+# committed): they name hosts, accounts and client details. The directory is
+# ignored as a whole so a new note is private by default rather than by anyone
+# remembering to add a line here.
+/docs/private/
+/CLAUDE.md
+
+# Written by CD on the runner before the release is synchronized.
+.deployed_sha
+
+# Spike do OneDrive: refresh token de conta pessoal, nunca versionado.
+.ms_token_cache.json
+
+# A preview the architecture renderer can write. Only the SVG is committed.
+/docs/architecture/system.png
+
+# Local Claude settings containing permissions and other sensitive configurations.
+.claude/settings.local.json
+

@@ -1,0 +1,16 @@
+---
+# Paths the deploy script and the runtime compose file already agree on. They
+# are written here once so the playbook never spells one of them differently.
+deploy_root: /opt/demo-firm-agent-v2
+config_root: /etc/demo-firm-agent
+deploy_user: deploy
+
+# The public half of the key held in the VPS_SSH_PRIVATE_KEY repository secret.
+# A public key is not a credential: it grants nothing on its own, and it is
+# written down here so the account can be rebuilt without going to look for it.
+deploy_public_key: >-
+  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC5mRyuAs7VkmE0CTlCmYO0ZOFSIihAbwKJlRnwFYJSn
+  github-actions@demo-firm
+
+# Where Let's Encrypt sends expiry warnings. Nothing else uses it.
+acme_email: admin@example.com

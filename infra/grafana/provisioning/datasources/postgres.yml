@@ -1,0 +1,30 @@
+apiVersion: 1
+
+# The application's own database, for the questions Prometheus cannot answer:
+# how many documents were ingested this month, who requested access and when,
+# which lawyer asks the most. Those live in tables, not in counters.
+#
+# It connects as a role that can only read, created by infra/sql/grafana_readonly.sql
+# and granted on named tables. A dashboard is a place where a typo runs against
+# production, and the answer to that is a connection that cannot write, not
+# care. The password comes from the environment, so nothing here is a secret.
+datasources:
+  - name: PostgreSQL
+    uid: postgres
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: ${GRAFANA_DB_USER}
+    database: ${DB_NAME}
+    editable: false
+    secureJsonData:
+      password: ${GRAFANA_DB_PASSWORD}
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+      # Grafana asks the database to do the work; a slow dashboard must not
+      # hold a connection open against the assistant's own pool.
+      maxOpenConns: 4
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+      timescaledb: false

@@ -1,0 +1,276 @@
+# Install this file as /etc/demo-firm-agent/runtime-compose.yml, owned by
+# root and not writable by the deployment account. It deliberately contains the
+# Docker runtime boundary; GitHub Actions only synchronizes application source.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-demo_firm}
+      POSTGRES_USER: ${DB_USER:-demo_firm_agent}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in the .env file}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - /opt/demo-firm-agent-v2/infra/init.sql:/docker-entrypoint-initdb.d/001-legal-assistant.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-demo_firm_agent} -d ${DB_NAME:-demo_firm}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    networks: [internal]
+
+  legal-bot:
+    build:
+      context: /opt/demo-firm-agent-v2
+    restart: unless-stopped
+    env_file: /opt/demo-firm-agent-v2/.env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - document_storage:/data/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      internal:
+      traefik:
+        # The name Traefik's forwardAuth uses to ask who may open Grafana:
+        # unique on the shared edge network, where "legal-bot" might not be.
+        aliases: [demo-firm-legal-bot]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:-edge}
+      traefik.http.routers.demo-firm-agent.entrypoints: web,websecure
+      traefik.http.routers.demo-firm-agent.rule: Host(`${LEGAL_AGENT_HOST:?Set LEGAL_AGENT_HOST in the .env file}`) && (Path(`/telegram/webhook`) || Path(`/health`))
+      traefik.http.routers.demo-firm-agent.tls: "true"
+      traefik.http.routers.demo-firm-agent.tls.certresolver: mytlschallenge
+      traefik.http.routers.demo-firm-agent.service: demo-firm-agent
+      # The pages people open, on a host of their own. Each host carries only
+      # its own paths: this one never answers the webhook, and the webhook's
+      # host never serves a page, so neither can be reached through the other.
+      # Moving the pages to the firm's domain is LEGAL_WEB_HOST and
+      # WEB_BASE_URL, and leaves the bot where it is.
+      traefik.http.routers.demo-firm-web.entrypoints: web,websecure
+      traefik.http.routers.demo-firm-web.rule: Host(`${LEGAL_WEB_HOST:?Set LEGAL_WEB_HOST in the .env file}`) && (PathPrefix(`/web/`) || PathPrefix(`/pje/`))
+      traefik.http.routers.demo-firm-web.tls: "true"
+      traefik.http.routers.demo-firm-web.tls.certresolver: mytlschallenge
+      traefik.http.routers.demo-firm-web.service: demo-firm-agent
+      traefik.http.services.demo-firm-agent.loadbalancer.server.port: "8000"
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    profiles: [observability]
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=180d"]
+    # Loopback only: reachable through an SSH tunnel and from nowhere else
+    # (Grafana, which reads it, is reached through the pages' sign-in). Prometheus has no authentication of its own, so a published
+    # port would hand anyone the firm's operational metrics.
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - /opt/demo-firm-agent-v2/infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /opt/demo-firm-agent-v2/infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      legal-bot:
+        condition: service_healthy
+    networks: [internal]
+
+  grafana:
+    image: grafana/grafana:13.2.0
+    profiles: [observability]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      # Unusable from outside: the login form and basic auth are off below.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-before-use}
+      GF_SERVER_ROOT_URL: https://${LEGAL_WEB_HOST:?Set LEGAL_WEB_HOST in the .env file}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      # Who comes in is decided by the pages' sign-in (core/web/observability.py),
+      # asked by Traefik before every request. Grafana only reads the header
+      # Traefik sets, and only from the subnet it shares with Traefik alone
+      # (infra/edge/edge-compose.yml), so no other container can send it.
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-WEBAUTH-USER
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_AUTH_PROXY_WHITELIST: 10.203.17.0/28
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Editor, for Explore over the logs. What the PostgreSQL datasource can
+      # read is bounded by the grafana_ro role, not by this.
+      GF_USERS_AUTO_ASSIGN_ORG_ROLE: Editor
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      # Read by the provisioned PostgreSQL datasource, which expands ${VAR}.
+      # The role is created by infra/sql/grafana_readonly.sql and can only read.
+      DB_NAME: ${DB_NAME:-demo_firm}
+      GRAFANA_DB_USER: ${GRAFANA_DB_USER:-grafana_ro}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-change-before-use}
+    # No published port: the way in is https://LEGAL_WEB_HOST/grafana/, through
+    # the pages' sign-in, owner only. A tunnel to 127.0.0.1:3000 would meet no
+    # login form and a refused header, so it is not offered.
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - /opt/demo-firm-agent-v2/infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - /opt/demo-firm-agent-v2/infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks: [internal, grafana]
+    depends_on: [prometheus, loki]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: demo-firm-grafana
+      traefik.http.routers.demo-firm-grafana.entrypoints: web,websecure
+      traefik.http.routers.demo-firm-grafana.rule: Host(`${LEGAL_WEB_HOST:?Set LEGAL_WEB_HOST in the .env file}`) && PathPrefix(`/grafana/`)
+      traefik.http.routers.demo-firm-grafana.tls: "true"
+      traefik.http.routers.demo-firm-grafana.tls.certresolver: mytlschallenge
+      # In this order: the client's copy of the login header goes first (an
+      # empty value removes it), then the pages say who is signed in.
+      traefik.http.routers.demo-firm-grafana.middlewares: demo-firm-grafana-drop-user,demo-firm-grafana-auth
+      traefik.http.routers.demo-firm-grafana.service: demo-firm-grafana
+      traefik.http.middlewares.demo-firm-grafana-drop-user.headers.customrequestheaders.X-WEBAUTH-USER: ""
+      traefik.http.middlewares.demo-firm-grafana-auth.forwardauth.address: http://demo-firm-legal-bot:8000/internal/grafana/auth
+      traefik.http.middlewares.demo-firm-grafana-auth.forwardauth.authResponseHeaders: X-WEBAUTH-USER
+      # Without this Traefik resolves the sign-in redirect (/web/) against the
+      # address above and sends the browser to the internal hostname.
+      traefik.http.middlewares.demo-firm-grafana-auth.forwardauth.preserveLocationHeader: "true"
+      traefik.http.services.demo-firm-grafana.loadbalancer.server.port: "3000"
+      # Typed without the final slash, /grafana would match no router.
+      traefik.http.routers.demo-firm-grafana-bare.entrypoints: web,websecure
+      traefik.http.routers.demo-firm-grafana-bare.rule: Host(`${LEGAL_WEB_HOST:?Set LEGAL_WEB_HOST in the .env file}`) && Path(`/grafana`)
+      traefik.http.routers.demo-firm-grafana-bare.tls: "true"
+      traefik.http.routers.demo-firm-grafana-bare.tls.certresolver: mytlschallenge
+      traefik.http.routers.demo-firm-grafana-bare.middlewares: demo-firm-grafana-slash
+      traefik.http.routers.demo-firm-grafana-bare.service: noop@internal
+      traefik.http.middlewares.demo-firm-grafana-slash.redirectregex.regex: ^https?://([^/]+)/grafana$$
+      traefik.http.middlewares.demo-firm-grafana-slash.redirectregex.replacement: https://$${1}/grafana/
+      traefik.http.middlewares.demo-firm-grafana-slash.redirectregex.permanent: "true"
+
+  # Alerts stop being decoration here: Prometheus evaluates the rules and hands
+  # what fires to this, which groups it, silences the noise a known outage
+  # would produce, and sends one message to Telegram.
+  #
+  # Its configuration is not mounted from the deploy directory. It carries a
+  # bot token, so it is rendered by scripts/install_alertmanager_config.sh into
+  # /etc/demo-firm-agent/, root-owned, exactly like this compose file.
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      # Silences and the alert history survive a restart only if this is set;
+      # without it a redeploy un-silences everything somebody muted.
+      - --data.retention=120h
+    volumes:
+      - /etc/demo-firm-agent/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    # Reached through Grafana and the SSH tunnel, never published: its API can
+    # silence every alert this firm has.
+    ports:
+      - "127.0.0.1:9093:9093"
+    networks: [internal]
+
+  # Redis reports on itself. The application already counts what it puts in the
+  # queue, but not what the queue is made of: memory against the ceiling,
+  # rejected connections, whether the append-only file is still being written.
+  #
+  # That gap matters here more than it would elsewhere. This Redis runs with
+  # maxmemory-policy noeviction, which is the right choice for a durable queue,
+  # because dropping a client's message to make room is not a trade this
+  # application may make. The consequence is that reaching the ceiling turns
+  # every enqueue into an error, the webhook answers 503, and Telegram retries
+  # in a loop. Nothing is lost and nothing is served, which is a hard state to
+  # recognise from the application's own metrics.
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.83.0
+    profiles: [observability]
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on: [redis]
+    networks: [internal]
+
+  # Log storage. A container's logs die with the container, and every deploy of
+  # this project has been chasing something that a redeploy then erased.
+  loki:
+    image: grafana/loki:3.5.7
+    profiles: [observability]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    user: "10001:10001"
+    volumes:
+      - /opt/demo-firm-agent-v2/infra/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    networks: [internal]
+
+  # The shipper: reads this host's container logs and pushes them to Loki.
+  #
+  # It mounts the Docker socket, which is worth saying out loud, because a
+  # process that can reach that socket can do anything the daemon can do. The
+  # alternative is reading raw files under /var/lib/docker/containers, where a
+  # container is a 64-character id and nothing else, and a log that cannot be
+  # attributed to a service is a log nobody reads.
+  alloy:
+    image: grafana/alloy:v1.11.2
+    profiles: [observability]
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - /opt/demo-firm-agent-v2/infra/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    # Reading the socket is a root operation on this host.
+    user: root
+    depends_on: [loki]
+    networks: [internal]
+
+networks:
+  internal:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-edge}
+  # Grafana and Traefik, and nothing else: Grafana believes the login header
+  # only from this subnet. Created by the edge stack, which owns the subnet.
+  grafana:
+    external: true
+    name: demo-firm-grafana
+
+volumes:
+  alertmanager_data:
+  alloy_data:
+  loki_data:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  document_storage:

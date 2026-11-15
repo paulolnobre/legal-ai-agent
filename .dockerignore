@@ -1,0 +1,13 @@
+.git/
+.agents/
+.codex/
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+tests/
+dist/
+*.tar.gz
+*.zip

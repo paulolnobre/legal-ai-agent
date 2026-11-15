@@ -1,0 +1,54 @@
+# The TLS edge. Installed as /etc/demo-firm-agent/edge-compose.yml.
+#
+# On the first VPS the agent borrowed a reverse proxy from an unrelated n8n
+# stack that happened to live on the same machine, which is why the agent's own
+# runtime compose still names its external network through TRAEFIK_NETWORK.
+# That stack does not exist on the Locaweb VPS, so the proxy is its own small
+# Compose project here and the network is simply called "edge".
+#
+# It owns ports 80 and 443. Nothing else on the host may bind them.
+services:
+  traefik:
+    image: traefik:v3.6.2
+    restart: unless-stopped
+    command:
+      - --log.level=INFO
+      # Routes come from container labels, and only from containers that ask
+      # for one, so a new container is never published by accident.
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=edge
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      # TLS-ALPN-01 answers the challenge on 443 itself, so no plain HTTP path
+      # has to be left open for it. The dashboard and API stay off: without
+      # authentication they hand a stranger the whole routing table.
+      - --certificatesresolvers.mytlschallenge.acme.tlschallenge=true
+      - --certificatesresolvers.mytlschallenge.acme.email=${SSL_EMAIL:?Set SSL_EMAIL}
+      - --certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - traefik_data:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [edge, grafana]
+
+networks:
+  edge:
+    name: edge
+  # Traefik and Grafana only. Grafana believes its login header from this
+  # subnet alone (GF_AUTH_PROXY_WHITELIST in infra/vps/runtime-compose.yml,
+  # kept equal by tests/test_grafana_access.py), so no container but these two
+  # may ever join it. Outside Docker's default pools, so it cannot collide
+  # with a network Docker hands out on its own.
+  grafana:
+    name: demo-firm-grafana
+    ipam:
+      config:
+        - subnet: 10.203.17.0/28
+
+volumes:
+  traefik_data:

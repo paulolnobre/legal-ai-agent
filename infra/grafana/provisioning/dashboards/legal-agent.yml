@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Demo Associados
+    orgId: 1
+    folder: Legal Agent
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

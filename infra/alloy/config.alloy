@@ -1,0 +1,93 @@
+// Grafana Alloy ships this host's container logs into Loki.
+//
+// Alloy rather than Promtail because Promtail reached end of life in early
+// 2026 and stopped receiving fixes, and this is the supported successor.
+//
+// It reads the Docker socket, which is worth stating plainly: a process that
+// can talk to that socket can do anything the daemon can do, read-only mount
+// or not. It is mounted anyway, because the alternative is reading the raw
+// log files under /var/lib/docker/containers, where a container is identified
+// by a 64-character id and nothing else, and a log you cannot attribute to a
+// service is a log nobody reads. Alloy runs on the same host it is watching,
+// under the same root that already owns the daemon.
+
+discovery.docker "containers" {
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "15s"
+}
+
+discovery.relabel "containers" {
+	targets = discovery.docker.containers.targets
+
+	// Docker reports "/demo-firm-v2-legal-bot-1"; the label drops the slash.
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "container"
+	}
+
+	// The compose project, so this firm's logs stay separable from anything
+	// else that shares the host.
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+		target_label  = "project"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		target_label  = "service"
+	}
+}
+
+loki.source.docker "containers" {
+	host       = "unix:///var/run/docker.sock"
+	targets    = discovery.relabel.containers.output
+	forward_to = [loki.process.application_json.receiver]
+	labels     = {host = "srv1591928"}
+}
+
+loki.process "application_json" {
+	// The application logs one JSON object per line. Uvicorn's access log does
+	// not, so every stage below has to survive a line that parses into nothing.
+	stage.json {
+		expressions = {
+			level     = "level",
+			logger    = "logger",
+			timestamp = "timestamp",
+		}
+	}
+
+	// Labels are an index, so only fields with few possible values become one.
+	// level and logger qualify. correlation_id and update_id never can: one
+	// value per conversation would create a stream per conversation and bring
+	// the index down. They stay inside the line, where LogQL can still filter
+	// on them.
+	stage.labels {
+		values = {
+			level  = "level",
+			logger = "logger",
+		}
+	}
+
+	// Without this, every line is stamped when Alloy read it rather than when
+	// the application wrote it, and a burst after a restart looks simultaneous.
+	stage.timestamp {
+		source            = "timestamp"
+		format            = "RFC3339Nano"
+		action_on_failure = "skip"
+	}
+
+	forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}
+
+// Alloy's own health, scraped by Prometheus like everything else.
+logging {
+	level  = "warn"
+	format = "logfmt"
+}

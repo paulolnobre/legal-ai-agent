@@ -1,0 +1,16 @@
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      # Enough for one application's history without letting a wide query walk
+      # the whole retention window.
+      maxLines: 2000
+      # A trace id would go here if this ever exports one. Until then the join
+      # between a metric spike and its logs is made by time and container.
+      timeout: 60

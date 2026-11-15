@@ -1,0 +1,367 @@
+name: CI/CD
+
+# Test, build, and on main deploy, in one workflow. Delivery used to be a
+# second workflow chained to this one by `workflow_run`; on 2026-10-06 the
+# push run for #108 was cancelled, the chained workflow saw a cancelled run,
+# skipped, and the merge sat undeployed with nothing saying so. Here the deploy
+# job `needs` the jobs that validated the commit and checks out that same
+# commit, so there is no second workflow to fall out of step with.
+on:
+  # Feature branches are covered by "Test Feature Branch"; running both on every
+  # push doubled the bill for the same pytest. This one keeps main and pull
+  # requests, which is what gates a release.
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # On main: test, build and deploy (a manual release is tested first). On any
+  # other branch: test and build only.
+  workflow_dispatch:
+
+# A pull request's older run is cancelled by a newer one: only its latest
+# version matters. Every other run gets a group of its own (its run id), so no
+# run on main waits behind or is cancelled by another; GitHub keeps one
+# pending run per group and cancels the rest, which is how a merge can be left
+# undeployed. Which commit reaches production is settled in the deploy job.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    # A real Postgres, the same image production runs. Most repository tests
+    # use doubles and that is fine, but where the query *is* the security
+    # property (a replayed login code refused by `last_counter < %s`, a session
+    # killed by a clock checked inside the UPDATE) a double that re-implements
+    # the condition tests the double. Those tests skip without a database, and
+    # a skip reads as green, so the database is provided here and a guard test
+    # fails if it ever goes missing.
+    services:
+      postgres:
+        # The runner pulls this itself, outside BuildKit, so it names Google's
+        # Docker Hub mirror directly: Docker Hub's anonymous limit returned 429
+        # for it on 2026-10-09. Same image as production's.
+        image: mirror.gcr.io/pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # pyright is pinned: an unpinned upgrade adds new checks and fails
+          # CI on a commit that changed nothing. Raise it deliberately.
+          pip install pytest ruff pyright==1.1.411
+
+      - name: Lint
+        run: ruff check .
+
+      # Ruff is type-blind. This is the gate that catches an Optional reaching a
+      # call that cannot take None, which reads fine and fails at runtime.
+      - name: Type check
+        run: pyright
+
+      # No .env is present here, which is what the suite expects: the LLM
+      # gateway tests assert the no-API-key fallback path.
+      - name: Test
+        run: pytest
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:ci@127.0.0.1:5432/postgres
+          # The promise that a database is here, stated where it is kept. The
+          # guard test enforces it only where this is set: the feature-branch
+          # workflow runs under GitHub Actions too, has no database on purpose,
+          # and must not fail for lacking one.
+          REQUIRE_TEST_DATABASE: "1"
+
+      # The diagram is Mermaid generated from the compiled graph, so this needs
+      # no system packages and no renderer: it runs the same code the app does
+      # and writes text. The previous version installed Graphviz through apt,
+      # which failed a pull request on 2026-09-09 when a mirror served a bad
+      # hash. A diagram format that can break an unrelated build is the wrong
+      # format.
+      - name: Check the architecture diagram matches the code
+        run: |
+          python docs/architecture/agent_flow.py
+          git diff --exit-code -- docs/architecture/agent-flow.md
+
+  image:
+    name: Build image
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v5
+
+      # GitHub's runners share Docker Hub's anonymous pull limit; on
+      # 2026-10-09 every build failed on "429 Too Many Requests" for the base
+      # image. BuildKit asks Google's public Docker Hub mirror first and falls
+      # back to Docker Hub. The VPS builds on its own and is unaffected.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      # Build only: catches a broken Dockerfile or an unresolvable pin.
+      - name: Build legal-assistant image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          # The cache is a speed-up, not a check. Its export failing ("failed
+          # to reserve cache", #108) after every step had built failed the job.
+          cache-to: type=gha,mode=max,ignore-error=true
+
+  deploy:
+    name: Deploy to the production VPS
+    # Only after both checks pass on this exact commit (a job's `if` without a
+    # status function also requires its needs to have succeeded), and only from
+    # main: a pull request, or a manual run on another branch, never deploys.
+    needs: [test, image]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    # The VPS secrets live in this environment, so only this job ever holds
+    # them; the test and build jobs above run without credentials.
+    environment:
+      name: production
+    # One deploy at a time, never one cut off halfway through a restart, and
+    # every deploy that waits keeps its place: the default queue holds one
+    # pending job and cancels the others, `max` keeps them all, first in first
+    # out. Arrival order is not commit order, so the step "Deploy only what is
+    # newer than production" decides whether each one still has work to do.
+    concurrency:
+      group: demo-firm-production
+      cancel-in-progress: false
+      queue: max
+    steps:
+      # The default ref is github.sha, the commit the jobs above validated.
+      # Full history, so the step that compares it with production can tell
+      # which of the two commits contains the other.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate deployment secrets
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          missing=()
+          for name in VPS_HOST VPS_USER VPS_SSH_PRIVATE_KEY VPS_SSH_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing production environment secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Configure SSH
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          # Both rsync and ssh read this, so the timeouts live in one place.
+          # Without ConnectTimeout, an unreachable host burns two minutes of
+          # the job before the TCP stack gives up and says nothing useful.
+          printf '%s\n' \
+            'Host *' \
+            '  ConnectTimeout 15' \
+            '  ServerAliveInterval 10' \
+            '  ServerAliveCountMax 3' \
+            '  TCPKeepAlive yes' > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      # Two merges can reach this lock in either order, and a slow run of an
+      # older commit must not overwrite a newer one. Two markers on the VPS say
+      # where production stands, each written whole (a temporary file, then a
+      # rename):
+      #   .releasing_sha  the commit a deploy started on, written before the
+      #                   files change and removed when the release is recorded;
+      #   .released_sha   the commit the last deploy finished, written only after
+      #                   the bot came back ready.
+      # A commit deploys when it contains both (or is the same: "Run workflow"
+      # redeploys). A deploy that stopped halfway leaves .releasing_sha behind,
+      # so nothing older than what it may have put live can follow it. An older
+      # commit says "Nothing to deploy" and succeeds. An unreadable VPS or
+      # marker, or a commit on no history this one shares, fails the job:
+      # guessing in either direction can put old code in production.
+      - name: Deploy only what is newer than production
+        id: fresh
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          root=/opt/demo-firm-agent-v2
+          read_marker() {
+            # "none" only when the file does not exist. ssh exits 255 when it
+            # cannot connect, and cat's own failure (unreadable, a directory)
+            # is the exit status too: both are retried, then fail the job.
+            local attempt
+            for attempt in 1 2 3; do
+              if ssh "$VPS_USER@$VPS_HOST" \
+                  "if [ -e $root/$1 ]; then cat $root/$1; else echo none; fi"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$((attempt * ${RETRY_SECONDS:-20}))"
+              fi
+            done
+            echo "::error::Could not read which commit production runs ($1); not deploying blind." >&2
+            return 1
+          }
+          released=$(read_marker .released_sha)
+          releasing=$(read_marker .releasing_sha)
+          # The tested commit's history is here (fetch-depth: 0); main's newer
+          # commits, which production may already run, are fetched.
+          git fetch --quiet origin main
+
+          for name in released releasing; do
+            recorded=${!name//[[:space:]]/}
+            if [ "$recorded" = none ] ||
+                git merge-base --is-ancestor "$recorded" "$GITHUB_SHA" 2>/dev/null; then
+              continue
+            fi
+            if git merge-base --is-ancestor "$GITHUB_SHA" "$recorded" 2>/dev/null; then
+              echo "::notice::Production is at or past $recorded ($name), which already contains $GITHUB_SHA. Nothing to deploy."
+              echo "deploy=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::.${name}_sha names '$recorded', which is on no history this commit shares."
+            echo "If that is expected, delete $root/.${name}_sha on the VPS and run this workflow on main."
+            exit 1
+          done
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mark the release as under way
+        if: steps.fresh.outputs.deploy == 'true'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh "$VPS_USER@$VPS_HOST" \
+            "printf '%s\\n' '$GITHUB_SHA' > /opt/demo-firm-agent-v2/.releasing_sha.tmp &&
+             mv /opt/demo-firm-agent-v2/.releasing_sha.tmp /opt/demo-firm-agent-v2/.releasing_sha"
+
+      - name: Record this release and where it is deployed from
+        if: steps.fresh.outputs.deploy == 'true'
+        env:
+          # The commit this run tested and checked out, not whatever main's
+          # head is by now: recording anything else would name a commit that
+          # was never deployed.
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          # A SYN dropped upstream leaves no trace anywhere: sshd never sees the
+          # connection, so the VPS logs are empty and the address that was
+          # blocked exists only here, on the runner, before the attempt. Without
+          # it a provider cannot be asked to look for the drop: the timestamp
+          # alone identifies nothing.
+          runner_ip=$(curl --silent --max-time 10 https://api.ipify.org || true)
+          if [ -n "$runner_ip" ]; then
+            echo "::notice::Deploying from runner address $runner_ip"
+          else
+            echo "::warning::Could not determine this runner's public address."
+          fi
+
+          # The image has no other way to say which commit it is. app_version is
+          # a constant somebody edits, so it can name a version it was never
+          # built from; matching an image's build time against a workflow run
+          # stops working as soon as two deploys land close together.
+          printf '%s\n' "$RELEASE_SHA" > .deployed_sha
+          echo "Release commit: $RELEASE_SHA"
+
+      - name: Synchronize release files
+        if: steps.fresh.outputs.deploy == 'true'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          # rsync only copies files, so running it again after a dropped
+          # connection is safe and lands in the same place. A deploy has failed
+          # on a transient SSH timeout with the VPS perfectly reachable minutes
+          # either side, and a release should not be lost to one bad minute of
+          # network.
+          sync_release() {
+            rsync --archive --no-owner --no-group --no-perms --omit-dir-times --compress \
+              --exclude='.env' \
+              --exclude='.released_sha*' \
+              --exclude='.releasing_sha*' \
+              --exclude='.git/' \
+              --exclude='.venv/' \
+              --exclude='__pycache__/' \
+              --exclude='*.pyc' \
+              --exclude='.pytest_cache/' \
+              --exclude='.ruff_cache/' \
+              --exclude='.deploy-backups/' \
+              --exclude='backups/' \
+              --exclude='uploads/' \
+              ./ "$VPS_USER@$VPS_HOST:/opt/demo-firm-agent-v2/"
+          }
+
+          for attempt in 1 2 3; do
+            if sync_release; then
+              echo "Release synchronized on attempt $attempt."
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              delay=$((attempt * 20))
+              echo "::warning::Sync attempt $attempt failed; retrying in ${delay}s."
+              sleep "$delay"
+            fi
+          done
+
+          echo "::error::Could not reach the VPS over SSH after three attempts."
+          echo "The host was unreachable from this runner, not refused: check that"
+          echo "the VPS is up, that port 22 is open, and that no firewall or"
+          echo "fail2ban rule is dropping GitHub Actions runner addresses."
+          exit 1
+
+      - name: Build, restart, and verify
+        if: steps.fresh.outputs.deploy == 'true'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh "$VPS_USER@$VPS_HOST" \
+            'sudo /usr/local/sbin/demo-firm-deploy'
+
+      # Written only now, after the deploy script saw the bot ready, and
+      # renamed into place so it is never half written: this is the commit the
+      # next deploy compares itself with. The under-way marker goes only after
+      # it, so there is no moment when neither names this commit.
+      - name: Record the release production now runs
+        if: steps.fresh.outputs.deploy == 'true'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh "$VPS_USER@$VPS_HOST" \
+            "printf '%s\\n' '$GITHUB_SHA' > /opt/demo-firm-agent-v2/.released_sha.tmp &&
+             mv /opt/demo-firm-agent-v2/.released_sha.tmp /opt/demo-firm-agent-v2/.released_sha &&
+             rm -f /opt/demo-firm-agent-v2/.releasing_sha"
