@@ -85,6 +85,7 @@ def test_deploy_runs_only_after_both_checks_and_only_from_main():
 
     assert job["needs"] == ["test", "image"]
     assert " ".join(job["if"].split()) == (
+        "vars.DEPLOY_ENABLED == 'true' && "
         "github.ref == 'refs/heads/main' && "
         "(github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
     )

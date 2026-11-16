@@ -134,7 +134,10 @@ jobs:
     # status function also requires its needs to have succeeded), and only from
     # main: a pull request, or a manual run on another branch, never deploys.
     needs: [test, image]
+    # DEPLOY_ENABLED is a repository variable. This public copy does not set
+    # it, so the deploy job is skipped here; the pipeline is kept as written.
     if: >-
+      vars.DEPLOY_ENABLED == 'true' &&
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
